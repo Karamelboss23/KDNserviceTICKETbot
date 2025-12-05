@@ -1,0 +1,1 @@
+python-3.12.3  # Sau 3.11.8 dacă vrei mai vechi – Render detectează automat dacă lipsește
