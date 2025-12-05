@@ -1,0 +1,187 @@
+import discord
+from discord import app_commands
+from discord.ext import commands
+import asyncio
+from datetime import datetime
+import io
+import json
+import os
+
+# ===================== CONFIGURAȚII =====================
+YOUR_ID = 1333165738478796860
+CO_OWNER_ID = 1325823719360172042
+
+TICKET_CATEGORY_ID = 1428398391951364355         # SCHIMBĂ
+LOG_CHANNEL_ID = 1431362281123614759             # SCHIMBĂ (pentru transcript)
+STAFF_ROLE_IDS = [1431362280364179555]  # SCHIMBĂ
+
+# Fișier unde ține minte ultimul număr pentru fiecare categorie
+COUNTER_FILE = "ticket_counters.json"
+
+# ===================== ÎNCARCĂ / SALVEAZĂ CONTOR =====================
+def load_counters():
+    if os.path.exists(COUNTER_FILE):
+        with open(COUNTER_FILE, "r") as f:
+            return json.load(f)
+    return {"comenzi": 0, "plata": 0, "parteneriate": 0, "general": 0}
+
+def save_counters(counters):
+    with open(COUNTER_FILE, "w") as f:
+        json.dump(counters, f)
+
+counters = load_counters()
+
+# ===================== BOTUL =====================
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="t!", intents=intents)
+tree = bot.tree
+
+@bot.event
+async def on_ready():
+    bot.add_view(TicketPanelView())
+    print(f"KDN Ticket System v2 → ONLINE ca {bot.user}")
+    await tree.sync()
+    print("Panel gata. Numerotare activată.")
+
+# ===================== PANELUL (fără emoji) =====================
+class TicketPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Comenzi & Conturi", style=discord.ButtonStyle.blurple, custom_id="ticket_orders")
+    async def orders(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await create_ticket(interaction, "comenzi", "Comenzi & Conturi")
+
+    @discord.ui.button(label="Plată & Refund", style=discord.ButtonStyle.red, custom_id="ticket_payment")
+    async def payment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await create_ticket(interaction, "plata", "Plată & Refund")
+
+    @discord.ui.button(label="Parteneriate", style=discord.ButtonStyle.gray, custom_id="ticket_partner")
+    async def partner(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await create_ticket(interaction, "parteneriate", "Parteneriate")
+
+    @discord.ui.button(label="Alte întrebări", style=discord.ButtonStyle.green, custom_id="ticket_other")
+    async def other(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await create_ticket(interaction, "general", "Alte întrebări")
+
+# ===================== CREARE TICKET CU NUMĂR =====================
+async def create_ticket(interaction: discord.Interaction, key: str, display_name: str):
+    user = interaction.user
+
+    # Verifică dacă are deja ticket deschis
+    for channel in interaction.guild.text_channels:
+        if str(user.id) in channel.name[-18:]:  # ultimele 18 cifre = ID-ul userului
+            return await interaction.response.send_message(f"Ai deja un ticket deschis: {channel.mention}", ephemeral=True)
+
+    # Crește contorul
+    counters[key] += 1
+    save_counters(counters)
+    ticket_number = f"{counters[key]:03d}"  # 001, 002, 003...
+
+    cat = bot.get_channel(TICKET_CATEGORY_ID)
+    if not cat:
+        return await interaction.response.send_message("Eroare: Categoria de tickete nu există!", ephemeral=True)
+
+    channel_name = f"{key}-{ticket_number}"
+    channel = await interaction.guild.create_text_channel(
+        name=channel_name,
+        category=cat,
+        topic=f"Ticket #{ticket_number} • {display_name} • {user}",
+        overwrites={
+            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True, view_channel=True, attach_files=True, read_message_history=True),
+            interaction.guild.me: discord.PermissionOverwrite(read_messages=True, manage_channels=True),
+        }
+    )
+
+    # Permisiuni staff
+    for role_id in STAFF_ROLE_IDS:
+        role = interaction.guild.get_role(role_id)
+        if role:
+            await channel.set_permissions(role, read_messages=True, send_messages=True, view_channel=True)
+
+    embed = discord.Embed(
+        title=f"Ticket #{ticket_number} • {display_name}",
+        description=f"{user.mention} bine ai venit!\n\nUn membru staff va răspunde în curând.",
+        color=0x00ff99,
+        timestamp=datetime.utcnow()
+    )
+    embed.set_author(name=user.display_name, icon_url=user.display_avatar.url)
+    embed.set_footer(text="KDNservices • Suport rapid • 24/7")
+
+    view = TicketControlView()
+    await channel.send(
+        content=f"{user.mention} " + " ".join(f"<@&{r}>" for r in STAFF_ROLE_IDS),
+        embed=embed,
+        view=view
+    )
+    await interaction.response.send_message(f"Ticket creat → {channel.mention}", ephemeral=True)
+
+# ===================== CONTROALE TICKET =====================
+class TicketControlView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Claim", style=discord.ButtonStyle.gray, custom_id="claim_ticket")
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not any(role.id in STAFF_ROLE_IDS for role in interaction.user.roles):
+            return await interaction.response.send_message("Doar staff-ul poate da claim!", ephemeral=True)
+        await interaction.response.send_message(f"{interaction.user.mention} a preluat ticketul", delete_after=15)
+
+    @discord.ui.button(label="Închide", style=discord.ButtonStyle.red, custom_id="close_ticket")
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not any(role.id in STAFF_ROLE_IDS for role in interaction.user.roles) and interaction.user.id not in (YOUR_ID, CO_OWNER_ID):
+            return await interaction.response.send_message("Doar staff-ul poate închide!", ephemeral=True)
+
+        await interaction.response.send_message("Ticketul se închide în 5 secunde...")
+        await asyncio.sleep(5)
+
+        # Transcript
+        transcript = ""
+        async for msg in interaction.channel.history(limit=None, oldest_first=True):
+            time = msg.created_at.strftime("%H:%M")
+            content = msg.content if msg.content else "[fișier/sticker/emoji]"
+            transcript += f"[{time}] {msg.author.display_name}: {content}\n"
+
+        file = discord.File(io.BytesIO(transcript.encode()), f"transcript-{interaction.channel.name}.txt")
+
+        log_channel = bot.get_channel(LOG_CHANNEL_ID)
+        if log_channel:
+            await log_channel.send(f"Transcript • {interaction.channel.name}", file=file)
+
+        await interaction.channel.delete()
+
+# ===================== SETUP PANEL =====================
+@tree.command(name="setup-panel", description="Creează panelul premium cu numerotare")
+async def setup_panel(interaction: discord.Interaction):
+    if interaction.user.id not in (YOUR_ID, CO_OWNER_ID):
+        return await interaction.response.send_message("Doar KDN poate crea panelul.", ephemeral=True)
+
+    embed = discord.Embed(
+        title="Suport KDNservices",
+        description="""
+**Alege categoria problemei tale:**
+
+• **Comenzi & Conturi** → cumpărături, livrare
+• **Plată & Refund** → probleme cu plata
+• **Parteneriate** → colaborări și reclamă
+• **Alte întrebări** → orice altceva
+        """,
+        color=0x00ff99
+    )
+    embed.set_footer(text="KDNservices • Numerotare automată • Suport 24/7")
+
+    await interaction.channel.send(embed=embed, view=TicketPanelView())
+    await interaction.response.send_message("Panel creat + numerotare activată! Primul ticket = comenzi-001", ephemeral=True)
+
+# ===================== RUN =====================
+bot.run(bot.run("TOKEN_AICI"))
+
+import os  # Adaugă sus în cod dacă nu e deja (după importurile discord)
+
+# ... restul codului tău intact ...
+
+bot.run(os.getenv("DISCORD_TOKEN"))
